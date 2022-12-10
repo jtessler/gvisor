@@ -177,6 +177,7 @@ type Args struct {
 // indicates that an existing Sandbox should be used. The caller must call
 // Destroy() on the container.
 func New(conf *config.Config, args Args) (*Container, error) {
+	ctx := context.Background()
 	log.Debugf("Create container, cid: %s, rootDir: %q", args.ID, conf.RootDir)
 	if err := validateID(args.ID); err != nil {
 		return nil, err
@@ -216,6 +217,8 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	cu := cleanup.Make(func() { _ = c.Destroy() })
 	defer cu.Clean()
 
+	var metricClient *sandbox.MetricClient
+
 	// Lock the container metadata file to prevent concurrent creations of
 	// containers with the same id.
 	if err := c.Saver.LockForNew(); err != nil {
@@ -236,6 +239,19 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	//      the sandbox ID.
 	if isRoot(args.Spec) {
 		log.Debugf("Creating new sandbox for container, cid: %s", args.ID)
+
+		// If we are going to create a new sandbox process, we may also need to create the metrics
+		// server for it.
+		// This server needs to live *outside* of the cgroup the sandbox process lives in, because it
+		// is reused across sandboxes within the same RootDir, and thus does not share the same
+		// lifecycle as sandbox or Gofer processes.
+		if conf.MetricServer != "" {
+			metricClient = sandbox.NewMetricClient(strings.ReplaceAll(conf.MetricServer, "%ID%", sandboxID), conf.RootDir)
+			defer metricClient.Close()
+			if err := metricClient.KickOff(ctx, conf); err != nil {
+				return nil, fmt.Errorf("cannot kick off metrics server: %w", err)
+			}
+		}
 
 		if args.Spec.Linux == nil {
 			args.Spec.Linux = &specs.Linux{}
@@ -342,6 +358,17 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		return nil, err
 	}
 
+	// Notify metrics server that a new sandbox may have been started.
+	if metricClient != nil {
+		if err := metricClient.RegisterSandbox(ctx, c.Sandbox, c.ID); err != nil {
+			return nil, fmt.Errorf("cannot register sandbox against metric server: %w", err)
+		}
+		cu.Add(func() {
+			metricClient.UnregisterSandbox(ctx, sandboxID)
+			metricClient.Close()
+		})
+	}
+
 	// "If any prestart hook fails, the runtime MUST generate an error,
 	// stop and destroy the container" -OCI spec.
 	if c.Spec.Hooks != nil {
@@ -379,7 +406,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 func (c *Container) Start(conf *config.Config) error {
 	log.Debugf("Start container, cid: %s", c.ID)
 
-	if err := c.Saver.lock(); err != nil {
+	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	unlock := cleanup.Make(c.Saver.UnlockOrDie)
@@ -463,7 +490,7 @@ func (c *Container) Start(conf *config.Config) error {
 // to restore a container from its state file.
 func (c *Container) Restore(spec *specs.Spec, conf *config.Config, restoreFile string) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
-	if err := c.Saver.lock(); err != nil {
+	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	defer c.Saver.UnlockOrDie()
@@ -649,7 +676,7 @@ func (c *Container) Checkpoint(f *os.File) error {
 // The call only succeeds if the container's status is created or running.
 func (c *Container) Pause() error {
 	log.Debugf("Pausing container, cid: %s", c.ID)
-	if err := c.Saver.lock(); err != nil {
+	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	defer c.Saver.UnlockOrDie()
@@ -669,7 +696,7 @@ func (c *Container) Pause() error {
 // The call only succeeds if the container's status is paused.
 func (c *Container) Resume() error {
 	log.Debugf("Resuming container, cid: %s", c.ID)
-	if err := c.Saver.lock(); err != nil {
+	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	defer c.Saver.UnlockOrDie()
@@ -710,7 +737,7 @@ func (c *Container) Processes() ([]*control.Process, error) {
 func (c *Container) Destroy() error {
 	log.Debugf("Destroy container, cid: %s", c.ID)
 
-	if err := c.Saver.lock(); err != nil {
+	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	defer func() {

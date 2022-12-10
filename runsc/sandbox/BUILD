@@ -6,6 +6,7 @@ go_library(
     name = "sandbox",
     srcs = [
         "memory.go",
+        "metric_client.go",
         "network.go",
         "network_unsafe.go",
         "sandbox.go",
@@ -15,6 +16,7 @@ go_library(
     ],
     visibility = [
         "//runsc:__subpackages__",
+        "//test:__subpackages__",
     ],
     deps = [
         "//pkg/atomicbitops",
@@ -23,6 +25,8 @@ go_library(
         "//pkg/control/server",
         "//pkg/coverage",
         "//pkg/log",
+        "//pkg/metric:metric_go_proto",
+        "//pkg/prometheus",
         "//pkg/sentry/control",
         "//pkg/sentry/platform",
         "//pkg/sentry/seccheck",

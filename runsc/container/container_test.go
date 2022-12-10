@@ -16,6 +16,7 @@ package container
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -34,7 +35,9 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -45,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -2700,7 +2704,7 @@ func TestSaveSystemdCgroup(t *testing.T) {
 	defer cont.Destroy()
 
 	cont.CompatCgroup = cgroup.CgroupJSON{Cgroup: cgroup.CreateMockSystemdCgroup()}
-	if err := cont.Saver.lock(); err != nil {
+	if err := cont.Saver.lock(BlockAcquire); err != nil {
 		t.Fatalf("cannot lock container metadata file: %v", err)
 	}
 	if err := cont.saveLocked(); err != nil {
@@ -2708,8 +2712,268 @@ func TestSaveSystemdCgroup(t *testing.T) {
 	}
 	cont.Saver.unlock()
 	loadCont := Container{}
-	cont.Saver.load(&loadCont)
+	cont.Saver.load(&loadCont, LoadOpts{})
 	if !reflect.DeepEqual(cont.CompatCgroup, loadCont.CompatCgroup) {
 		t.Errorf("CompatCgroup not properly saved: want %v, got %v", cont.CompatCgroup, loadCont.CompatCgroup)
+	}
+}
+
+// getPrometheusInteger returns the integer value of a Prometheus metric with given name and labels.
+// This doesn't actually verify that the rest of the data contains valid Prometheus-formatted data.
+func getPrometheusInteger(rawData string, metricName string, labels map[string]string) (int64, time.Time, error) {
+	var wantPrefix string
+	if len(labels) == 0 {
+		wantPrefix = fmt.Sprintf("%s ", metricName)
+	} else {
+		wantPrefix = fmt.Sprintf("%s{%s} ", metricName, strings.Join(prometheus.OrderedLabels(labels), ","))
+	}
+	var found bool
+	var intValue int64
+	var timeMillis int64
+	var err error
+	for _, line := range strings.Split(rawData, "\n") {
+		if !strings.HasPrefix(line, wantPrefix) {
+			continue
+		}
+		if found {
+			return 0, time.Time{}, fmt.Errorf("found multiple lines matching prefix %q", wantPrefix)
+		}
+		components := strings.SplitN(line, " ", 3)
+		if len(components) != 3 {
+			return 0, time.Time{}, fmt.Errorf("line %q did not have 3 components", line)
+		}
+		intValue, err = strconv.ParseInt(components[1], 10, 64)
+		if err != nil {
+			return 0, time.Time{}, fmt.Errorf("cannot convert value component %q of line %q into integer: %v", components[1], line, err)
+		}
+		timeMillis, err = strconv.ParseInt(components[2], 10, 64)
+		if err != nil {
+			return 0, time.Time{}, fmt.Errorf("cannot convert time component %q of line %q into integer: %v", components[2], line, err)
+		}
+		found = true
+	}
+	if !found {
+		return 0, time.Time{}, fmt.Errorf("no line matching prefix %q found", wantPrefix)
+	}
+	return intValue, time.UnixMilli(timeMillis), nil
+}
+
+// getPrometheusContainerInteger returns the integer value of a Prometheus metric from the
+// given container name.
+func getPrometheusContainerInteger(rawData string, metricName, containerName string) (int64, time.Time, error) {
+	return getPrometheusInteger(rawData, metricName, map[string]string{
+		"sandbox":   containerName,
+		"container": containerName,
+	})
+}
+
+// metricsTest is returned by setupMetrics.
+type metricsTest struct {
+	testCtx   context.Context
+	rootDir   string
+	bundleDir string
+	sleepSpec *specs.Spec
+	sleepConf *config.Config
+	udsPath   string
+	client    *sandbox.MetricClient
+}
+
+// setupMetrics sets up a container configuration with metrics enabled, and returns it all.
+// Also returns a cleanup function.
+func setupMetrics(t *testing.T) (*metricsTest, func()) {
+	// Start the child reaper.
+	childReaper := &testutil.Reaper{}
+	childReaper.Start()
+	cu := cleanup.Make(childReaper.Stop)
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cu.Add(cleanupCancel)
+	testCtx, testCancel := context.WithTimeout(cleanupCtx, 25*time.Second)
+	cu.Add(testCancel)
+
+	spec, conf := sleepSpecConf(t)
+	conf.MetricServer = "%RUNTIME_ROOT%/metrics.sock"
+	conf.MetricExporterPrefix = "testmetric_"
+	rootDir, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	cu.Add(cleanup)
+	udsPath := filepath.Join(rootDir, "metrics.sock")
+	if len(udsPath) >= 100 {
+		t.Fatalf("Runtime root is %s which means the metrics UDS %s (%d bytes) is longer than the maximum length allowed for a UDS path. Please adjust the test.", rootDir, udsPath, len(udsPath))
+	}
+	// The UDS should be deleted by the metrics server itself, but we clean it up here anyway just in case:
+	cu.Add(func() { os.Remove(udsPath) })
+	metricClient := sandbox.NewMetricClient(udsPath, rootDir)
+	cu.Add(func() { metricClient.ShutdownServer(cleanupCtx) })
+
+	return &metricsTest{
+		testCtx:   testCtx,
+		rootDir:   rootDir,
+		bundleDir: bundleDir,
+		sleepSpec: spec,
+		sleepConf: conf,
+		udsPath:   udsPath,
+		client:    metricClient,
+	}, cu.Clean
+}
+
+// TestContainerMetrics verifies basic functionality of the metric server works.
+func TestContainerMetrics(t *testing.T) {
+	targetOpens := 200
+
+	te, cleanup := setupMetrics(t)
+	defer cleanup()
+
+	if _, err := te.client.GetMetrics(te.testCtx); err == nil {
+		t.Fatal("GetMetrics unexpectedly succeeded prior to container start (leaking metric server processes between tests?)")
+	}
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      te.sleepSpec,
+		BundleDir: te.bundleDir,
+	}
+	cont, err := New(te.sleepConf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	udsStat, udsStatErr := os.Stat(te.udsPath)
+	if udsStatErr != nil {
+		t.Fatalf("Stat(%s) failed after creating container: %v", te.udsPath, udsStatErr)
+	}
+	if udsStat.Mode()&os.ModeSocket == 0 {
+		t.Errorf("Stat(%s): Got mode %x, expected socket (mode %x)", te.udsPath, udsStat.Mode(), os.ModeSocket)
+	}
+	initialData, err := te.client.GetMetrics(te.testCtx)
+	if err != nil {
+		t.Errorf("Cannot get metrics after creating container: %v", err)
+	}
+	t.Logf("Metrics prior to container start:\n\n%s\n\n", initialData)
+	if err := cont.Start(te.sleepConf); err != nil {
+		t.Fatalf("Cannot start container: %v", err)
+	}
+	postStartData, err := te.client.GetMetrics(te.testCtx)
+	if err != nil {
+		t.Fatalf("Cannot get metrics after starting container: %v", err)
+	}
+	postStartOpens, postStartTimestamp, err := getPrometheusContainerInteger(postStartData, "testmetric_fs_opens", args.ID)
+	if err != nil {
+		t.Errorf("Cannot get testmetric_fs_opens from following data (err: %v):\n\n%s\n\n", err, postStartData)
+	}
+	t.Logf("After container start, fs_opens=%d (snapshotted at %v)", postStartOpens, postStartTimestamp)
+	// The touch operation may fail from permission errors, but the metric should still be incremented.
+	shOutput, err := executeCombinedOutput(te.sleepConf, cont, "/bin/bash", "-c", fmt.Sprintf("for i in $(seq 1 %d); do touch /tmp/$i || true; done", targetOpens))
+	if err != nil {
+		t.Fatalf("Exec failed: %v; output: %v", err, shOutput)
+	}
+	postExecData, err := te.client.GetMetrics(te.testCtx)
+	if err != nil {
+		t.Fatalf("Cannot get metrics after a bunch of open() calls: %v", err)
+	}
+	postExecOpens, postExecTimestamp, err := getPrometheusContainerInteger(postExecData, "testmetric_fs_opens", args.ID)
+	if err != nil {
+		t.Errorf("Cannot get testmetric_fs_opens from following data (err: %v):\n\n%s\n\n", err, postExecData)
+	}
+	t.Logf("After exec'ing a hundred open()s, fs_opens=%d (snapshotted at %v)", postExecOpens, postExecTimestamp)
+	diffOpens := postExecOpens - postStartOpens
+	if diffOpens < int64(targetOpens) {
+		t.Errorf("testmetric_fs_opens went from %d to %d (diff: %d), expected the difference to be at least %d", postStartOpens, postExecOpens, diffOpens, targetOpens)
+	}
+}
+
+// TestContainerMetricsMultiple verifies that the metric server spawned for one container
+// serves metrics for all containers, and survives past its initial container's lifetime.
+func TestContainerMetricsMultiple(t *testing.T) {
+	numConcurrentContainers := 5
+
+	te, cleanup := setupMetrics(t)
+	defer cleanup()
+	var containers []*Container
+	needCleanup := map[*Container]struct{}{}
+	toDestroy := map[*Container]struct{}{}
+	defer func() {
+		for container := range needCleanup {
+			container.Destroy()
+		}
+	}()
+
+	// Start a bunch of containers with metrics.
+	for i := 0; i < numConcurrentContainers; i++ {
+		cont, err := New(te.sleepConf, Args{
+			ID:        testutil.RandomContainerID(),
+			Spec:      te.sleepSpec,
+			BundleDir: te.bundleDir,
+		})
+		if err != nil {
+			t.Fatalf("error creating container: %v", err)
+		}
+		containers = append(containers, cont)
+		needCleanup[cont] = struct{}{}
+		// Note that this includes the first container, which will be the one that
+		// starts the metrics server.
+		if i%2 == 0 {
+			toDestroy[cont] = struct{}{}
+		}
+		if err := cont.Start(te.sleepConf); err != nil {
+			t.Fatalf("Cannot start container: %v", err)
+		}
+	}
+
+	// Start one container with metrics turned off.
+	sleepConfNoMetrics := *te.sleepConf
+	sleepConfNoMetrics.MetricServer = ""
+	noMetricsCont, err := New(&sleepConfNoMetrics, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      te.sleepSpec,
+		BundleDir: te.bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating no-metrics container: %v", err)
+	}
+	defer noMetricsCont.Destroy()
+
+	// Verify that the metrics server says what we expect.
+	gotData, err := te.client.GetMetrics(te.testCtx)
+	if err != nil {
+		t.Fatalf("Cannot get metrics after starting containers: %v", err)
+	}
+	t.Logf("Metrics after starting all containers:\n\n%s\n\n", gotData)
+	for _, container := range containers {
+		if _, _, err := getPrometheusContainerInteger(gotData, "testmetric_fs_opens", container.ID); err != nil {
+			t.Errorf("Cannot get testmetric_fs_opens for container %s: %v", container.ID, err)
+		}
+	}
+	if val, _, err := getPrometheusContainerInteger(gotData, "testmetric_fs_opens", noMetricsCont.ID); err == nil {
+		t.Errorf("Unexpectedly found testmetric_fs_opens metric data for no-metrics container %s: %v", noMetricsCont.ID, val)
+	}
+
+	// Stop every other container.
+	for container := range toDestroy {
+		if err := container.Destroy(); err != nil {
+			t.Logf("Warning: cannot destroy container %s: %v", container.ID, err)
+			continue
+		}
+		delete(needCleanup, container)
+	}
+
+	// Verify that now we only have half the containers.
+	gotData, err = te.client.GetMetrics(te.testCtx)
+	if err != nil {
+		t.Fatalf("Cannot get metrics after stopping half the containers: %v", err)
+	}
+	t.Logf("Metrics after stopping half the containers:\n\n%s\n\n", gotData)
+	for _, container := range containers {
+		val, _, err := getPrometheusContainerInteger(gotData, "testmetric_fs_opens", container.ID)
+		_, wantErr := toDestroy[container]
+		if gotErr := err != nil; gotErr && !wantErr {
+			t.Errorf("Wanted to find data for container %s but didn't: %v", container.ID, err)
+		} else if !gotErr && wantErr {
+			t.Errorf("Wanted to find no data for container %s but found this value instead: %v", container.ID, val)
+		}
+	}
+	if val, _, err := getPrometheusContainerInteger(gotData, "testmetric_fs_opens", noMetricsCont.ID); err == nil {
+		t.Errorf("Unexpectedly found testmetric_fs_opens metric data for no-metrics container %s: %v", noMetricsCont.ID, val)
 	}
 }
