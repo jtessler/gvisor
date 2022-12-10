@@ -33,12 +33,15 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/encoding/prototext"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/log"
+	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
+	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -111,6 +114,13 @@ type Sandbox struct {
 	// OriginalOOMScoreAdj stores the value of oom_score_adj when the sandbox
 	// started, before it may be modified.
 	OriginalOOMScoreAdj int `json:"originalOomScoreAdj"`
+
+	// RegisteredMetrics is the set of metrics registered in the sandbox.
+	// Used for verifying metric data integrity after containers are started.
+	// Only populated if a exporting metrics was requested when the sandbox was
+	// created.
+	// This is a textproto string of metricpb.MetricRegistration.
+	RegisteredMetrics string `json:"registeredMetrics"`
 
 	// child is set if a sandbox process is a child of the current process.
 	//
@@ -1176,6 +1186,36 @@ func (s *Sandbox) Reduce(wait bool) error {
 	return conn.Call(boot.UsageReduce, &control.UsageReduceOpts{
 		Wait: wait,
 	}, nil)
+}
+
+// GetRegisteredMetrics returns metric registration data from the sandbox.
+// This data is meant to be used as a way to sanity-check any exported metrics data during the
+// lifetime of the sandbox, in order to avoid a compromised sandbox from being able to produce
+// bogus metrics.
+// This returns an error if the sandbox has not requested instrumentation during creation time.
+func (s *Sandbox) GetRegisteredMetrics() (*metricpb.MetricRegistration, error) {
+	if s.RegisteredMetrics == "" {
+		return nil, errors.New("sandbox did not request instrumentation when it was created")
+	}
+	registeredMetrics := &metricpb.MetricRegistration{}
+	if err := prototext.Unmarshal([]byte(s.RegisteredMetrics), registeredMetrics); err != nil {
+		return nil, err
+	}
+	return registeredMetrics, nil
+}
+
+// ExportMetrics writes Prometheus-formatted metrics data to the given io.Writer.
+func (s *Sandbox) ExportMetrics() (*prometheus.Snapshot, error) {
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	data := &control.MetricsExportData{}
+	if err = conn.Call(boot.MetricsExport, &control.MetricsExportOpts{}, data); err != nil {
+		return nil, err
+	}
+	return data.Snapshot, nil
 }
 
 // IsRunning returns true if the sandbox or gofer process is running.

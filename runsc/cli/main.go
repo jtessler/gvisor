@@ -94,6 +94,7 @@ func Main(version string) {
 	subcommands.Register(new(cmd.Statefile), debugGroup)
 	subcommands.Register(new(cmd.Symbolize), debugGroup)
 	subcommands.Register(new(cmd.Usage), debugGroup)
+	subcommands.Register(new(cmd.MetricExport), debugGroup)
 	subcommands.Register(new(cmd.ReadControl), debugGroup)
 	subcommands.Register(new(cmd.WriteControl), debugGroup)
 
@@ -102,6 +103,7 @@ func Main(version string) {
 	subcommands.Register(new(cmd.Boot), internalGroup)
 	subcommands.Register(new(cmd.Gofer), internalGroup)
 	subcommands.Register(new(cmd.Umount), internalGroup)
+	subcommands.Register(new(cmd.MetricServer), internalGroup)
 
 	// Register with the main command line.
 	config.RegisterFlags(flag.CommandLine)

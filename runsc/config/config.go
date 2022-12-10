@@ -139,6 +139,25 @@ type Config struct {
 	// If unset, a sane platform-specific default will be used.
 	PlatformDevicePath string `flag:"platform_device_path"`
 
+	// MetricServer, if set, indicates that metrics should be exported on this address.
+	// This may either be "addr:port" to export metrics on a specific network interface address, or
+	// ":port" for exporting metrics on all addresses, or an absolute path to a Unix Domain Socket.
+	// The substring "%ID%" will be replaced by the container ID, and "%RUNTIME_ROOT%" by the root.
+	// If a metrics server is already running at this address, this metrics server will be notified of
+	// the new sandbox, and the sandbox's metrics will be added to the existing metrics server.
+	MetricServer string `flag:"metric-server"`
+
+	// MetricServerPersist, if true, indicates that the metric server should stay up continuously even
+	// after all sandboxes have terminated. By default (or if this setting is false), the metric
+	// server will only stay up for a few minutes after the last sandbox it is aware of has
+	// terminated.
+	MetricServerPersist bool `flag:"metric-server-persist"`
+
+	// MetricExporterPrefix is added as prefix to all metric names.
+	// It is used to follow Prometheus's exporter convention, whereby all metric names should be
+	// prefixed by a name meaningfully identifying the software exporting the metric.
+	MetricExporterPrefix string `flag:"metric-exporter-prefix"`
+
 	// Strace indicates that strace should be enabled.
 	Strace bool `flag:"strace"`
 

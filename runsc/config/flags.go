@@ -51,6 +51,11 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("allow-flag-override", false, "allow OCI annotations (dev.gvisor.flag.<name>) to override flags for debugging.")
 	flagSet.String("traceback", "system", "golang runtime's traceback level")
 
+	// Metrics flags.
+	flagSet.String("metric-server", "", "if set, export metrics. This may either be 'addr:port' to export metrics on a specific network interface address, or ':port' for exporting metrics on all addresses, or an absolute path to a Unix Domain Socket. The substring '%ID%' will be replaced by the container ID, and '%RUNTIME_ROOT%' by the root. If a metric server is already running at this address, this metric server will be notified of the new sandbox, and the sandbox's metrics will be added to the existing metric server.")
+	flagSet.Bool("metric-server-persist", false, "if set, the metric server will persist forever after the last sandbox it knows about has terminated. Otherwise (if false), the metric server will exit a few minutes after the last sandbox it knows about has terminated.")
+	flagSet.String("metric-exporter-prefix", "runsc_", "prefix for all metric names, following Prometheus exporter convention")
+
 	// Debugging flags: strace related
 	flagSet.Bool("strace", false, "enable strace.")
 	flagSet.String("strace-syscalls", "", "comma-separated list of syscalls to trace. If --strace is true and this list is empty, then all syscalls will be traced.")
