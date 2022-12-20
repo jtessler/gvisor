@@ -71,6 +71,7 @@ def _syscall_test(
         add_host_communication = False,
         container = None,
         one_sandbox = True,
+        use_fusefs = False,
         **kwargs):
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
@@ -83,6 +84,8 @@ def _syscall_test(
         name += "_overlay"
     if network != "none":
         name += "_" + network + "net"
+    if use_fusefs:
+        name += "_fuse"
 
     # Apply all tags.
     if tags == None:
@@ -130,6 +133,7 @@ def _syscall_test(
         "--platform-support=" + platform_support,
         "--network=" + network,
         "--use-tmpfs=" + str(use_tmpfs),
+        "--use-fusefs=" + str(use_fusefs),
         "--file-access=" + file_access,
         "--overlay=" + str(overlay),
         "--add-host-communication=" + str(add_host_communication),
@@ -161,6 +165,7 @@ def all_platforms():
 def syscall_test(
         test,
         use_tmpfs = False,
+        use_fusefs = False,
         add_overlay = False,
         add_host_communication = False,
         add_hostinet = False,
@@ -252,5 +257,18 @@ def syscall_test(
             container = container,
             one_sandbox = one_sandbox,
             file_access = "shared",
+            **kwargs
+        )
+    if use_fusefs:
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = True,
+            use_fusefs = True,
+            add_host_communication = add_host_communication,
+            tags = platforms.get(default_platform, []) + tags,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
             **kwargs
         )
