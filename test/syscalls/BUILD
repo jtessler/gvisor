@@ -128,6 +128,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:creat_test",
+    use_fusefs = True,
 )
 
 syscall_test(
@@ -326,6 +327,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:mknod_test",
+    use_fusefs = True,
 )
 
 syscall_test(
@@ -912,12 +914,14 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:statfs_test",
+    use_fusefs = True,
     use_tmpfs = True,  # Test specifically relies on TEST_TMPDIR to be tmpfs.
 )
 
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:stat_test",
+    use_fusefs = True,
 )
 
 syscall_test(
