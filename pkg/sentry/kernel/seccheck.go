@@ -19,17 +19,40 @@ import (
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
 
+func getTaskCurrentWorkingDirectory(t *Task) string {
+	// Grab the filesystem context first since it needs tasks.mu to be locked.
+	t.k.tasks.mu.RLock()
+	fctx := t.FSContext()
+	fctx.IncRef()
+	defer fctx.DecRef(t)
+	t.k.tasks.mu.RUnlock()
+
+	// Perform VFS operations outside of task mutex to avoid circular locking with
+	// filesystem mutexes.
+	var cwd string
+	if root := fctx.RootDirectory(); root.Ok() {
+		defer root.DecRef(t)
+		if wd := fctx.WorkingDirectory(); wd.Ok() {
+			defer wd.DecRef(t)
+			vfsObj := root.Mount().Filesystem().VirtualFilesystem()
+			cwd, _ = vfsObj.PathnameWithDeleted(t, root, wd)
+		}
+	}
+	return cwd
+}
+
 // LoadSeccheckData sets info from the task based on mask.
 func LoadSeccheckData(t *Task, mask seccheck.FieldMask, info *pb.ContextData) {
+	cwd := getTaskCurrentWorkingDirectory(t)
 	t.k.tasks.mu.RLock()
 	defer t.k.tasks.mu.RUnlock()
-	LoadSeccheckDataLocked(t, mask, info)
+	LoadSeccheckDataLocked(t, mask, info, cwd)
 }
 
 // LoadSeccheckDataLocked sets info from the task based on mask.
 //
 // Preconditions: The TaskSet mutex must be locked.
-func LoadSeccheckDataLocked(t *Task, mask seccheck.FieldMask, info *pb.ContextData) {
+func LoadSeccheckDataLocked(t *Task, mask seccheck.FieldMask, info *pb.ContextData, cwd string) {
 	if mask.Contains(seccheck.FieldCtxtTime) {
 		info.TimeNs = t.k.RealtimeClock().Now().Nanoseconds()
 	}
@@ -49,14 +72,7 @@ func LoadSeccheckDataLocked(t *Task, mask seccheck.FieldMask, info *pb.ContextDa
 		info.ContainerId = t.tg.leader.ContainerID()
 	}
 	if mask.Contains(seccheck.FieldCtxtCwd) {
-		if root := t.FSContext().RootDirectory(); root.Ok() {
-			defer root.DecRef(t)
-			if wd := t.FSContext().WorkingDirectory(); wd.Ok() {
-				defer wd.DecRef(t)
-				vfsObj := root.Mount().Filesystem().VirtualFilesystem()
-				info.Cwd, _ = vfsObj.PathnameWithDeleted(t, root, wd)
-			}
-		}
+		info.Cwd = cwd
 	}
 	if mask.Contains(seccheck.FieldCtxtProcessName) {
 		info.ProcessName = t.Name()
