@@ -2212,3 +2212,75 @@ func TestMultiContainerShm(t *testing.T) {
 		t.Fatalf("wrong output, want: %q, got: %v", want, out)
 	}
 }
+
+// Test that using file-backed overlay does not lead to memory leak.
+func TestMultiContainerOverlayMemory(t *testing.T) {
+	conf := testutil.TestConfig(t)
+
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	// Configure root overlay backed by a file from /tmp.
+	conf.Overlay2 = config.Overlay2{
+		RootMount:    true,
+		FilestoreDir: "/tmp",
+	}
+
+	// Root container will just sleep.
+	sleep := []string{"sleep", "100"}
+	// Since all containers share the same conf.RootDir, and root filesystems
+	// have overlay enabled, the root directory should never be modified. Hence,
+	// creating file at the same location should not lead to EEXIST error.
+	createFile := []string{"/bin/sh", "-c", "if [ -f /testfile ]; then echo \"File already exists\"; exit 1; fi; echo Hello > /testfile"}
+	testSpecs, ids := createSpecs(sleep, createFile, createFile, createFile)
+	// Make sure none of the root filesystems are read-only, otherwise we won't
+	// be able to create the file.
+	for _, s := range testSpecs {
+		s.Root.Readonly = false
+	}
+
+	// Start the root container.
+	rootCont, cleanup, err := startContainers(conf, testSpecs[:1], ids[:1])
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+
+	// Remember the overlay filestore usage right now.
+	oldUsage, err := rootCont[0].Sandbox.OverlayFileUsage()
+	if err != nil {
+		t.Fatalf("sandbox.OverlayFileUsage failed: %v", err)
+	}
+
+	for i := 1; i < len(testSpecs); i++ {
+		// Run one sub-container.
+		subCont, cleanup, err := startContainers(conf, testSpecs[i:i+1], ids[i:i+1])
+		if err != nil {
+			t.Fatalf("error starting containers: %v", err)
+		}
+		defer cleanup()
+
+		// Wait for the sub-container to stop.
+		if ws, err := subCont[0].Wait(); err != nil {
+			t.Errorf("failed to wait for subcontainer number %d: %v", i, err)
+		} else if es := ws.ExitStatus(); es != 0 {
+			t.Errorf("subcontainer number %d exited with non-zero status %d", i, es)
+		}
+
+		// Make sure the overlay filestore usage is back to what it was. The
+		// sub-container created a file in overlay. But it should have been cleaned
+		// up once the container exited.
+		newUsage, err := subCont[0].Sandbox.OverlayFileUsage()
+		if err != nil {
+			t.Fatalf("sandbox.OverlayFileUsage failed: %v", err)
+		}
+
+		if oldUsage != newUsage {
+			t.Errorf("overlay filestore usage changed: old = %d, new = %d", oldUsage, newUsage)
+		}
+	}
+}
