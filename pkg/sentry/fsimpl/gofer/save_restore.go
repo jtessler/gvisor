@@ -118,8 +118,8 @@ func (d *dentry) prepareSaveRecursive(ctx context.Context) error {
 			write: d.writeFDLisa.Ok(),
 		}
 	}
-	d.dirMu.Lock()
-	defer d.dirMu.Unlock()
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
 	for _, child := range d.children {
 		if child != nil {
 			if err := child.prepareSaveRecursive(ctx); err != nil {

@@ -38,7 +38,7 @@ func (d *dentry) isDir() bool {
 
 // Preconditions:
 //   - filesystem.renameMu must be locked.
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for reading.
 //   - d.isDir().
 //   - child must be a newly-created dentry that has never had a parent.
 func (d *dentry) insertCreatedChildLocked(ctx context.Context, childIno *lisafs.Inode, childName string, updateChild func(child *dentry), ds **[]*dentry) error {
@@ -60,13 +60,15 @@ func (d *dentry) insertCreatedChildLocked(ctx context.Context, childIno *lisafs.
 
 // Preconditions:
 //   - filesystem.renameMu must be locked.
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for reading.
 //   - d.isDir().
 //   - child must be a newly-created dentry that has never had a parent.
 func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
 	d.IncRef() // reference held by child on its parent
 	child.parent = d
 	child.name = name
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
 	if d.children == nil {
 		d.children = make(map[string]*dentry)
 	} else if c, ok := d.children[name]; ok && c == nil {
@@ -77,10 +79,13 @@ func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
 }
 
 // Preconditions:
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for reading.
 //   - d.isDir().
 //   - name is not already a negative entry.
 func (d *dentry) cacheNegativeLookupLocked(name string) {
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
+
 	// Don't cache negative lookups if InteropModeShared is in effect (since
 	// this makes remote lookup unavoidable), or if d.isSynthetic() (in which
 	// case the only files in the directory are those for which a dentry exists
@@ -133,7 +138,7 @@ type createSyntheticOpts struct {
 // in d.
 //
 // Preconditions:
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for reading.
 //   - d.isDir().
 //   - d does not already contain a child with the given name.
 func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
@@ -176,8 +181,10 @@ func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
 }
 
 // Preconditions:
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for reading.
 func (d *dentry) clearDirentsLocked() {
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
 	d.dirents = nil
 	d.childrenSet = nil
 }
@@ -231,7 +238,7 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	// presence of concurrent mutation of an iterated directory, so
 	// implementations may duplicate or omit entries in this case, which
 	// violates POSIX semantics. Thus we read all directory entries while
-	// holding d.dirMu to exclude directory mutations. (Note that it is
+	// holding d.opMu to exclude directory mutations. (Note that it is
 	// impossible for the client to exclude concurrent mutation from other
 	// remote filesystem users. Since there is no way to detect if the server
 	// has incorrectly omitted directory entries, we simply assume that the
@@ -241,11 +248,11 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	// to readdir RPCs), but is consistent with VFS1.
 
 	// filesystem.renameMu is needed for d.parent, and must be locked before
-	// dentry.dirMu.
+	// dentry.opMu.
 	d.fs.renameMu.RLock()
 	defer d.fs.renameMu.RUnlock()
-	d.dirMu.Lock()
-	defer d.dirMu.Unlock()
+	d.opMu.RLock()
+	defer d.opMu.RUnlock()
 	if d.dirents != nil {
 		return d.dirents, nil
 	}
@@ -323,6 +330,12 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 			}
 		}
 	}
+
+	// Need to hold d.childrenMu from here on to read d.syntheticChildren
+	// and (possibly) cache d.childrenSet.
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
+
 	// Emit entries for synthetic children.
 	if d.syntheticChildren != 0 {
 		for _, child := range d.children {

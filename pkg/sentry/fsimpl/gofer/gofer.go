@@ -21,7 +21,8 @@
 //	  filesystem.renameMu
 //	    dentry.cachingMu
 //	      dentryCache.mu
-//	      dentry.dirMu
+//	      dentry.opMu
+//	        dentry.childrenMu
 //	        filesystem.syncMu
 //	        dentry.metadataMu
 //	          *** "memmap.Mappable locks" below this point
@@ -33,7 +34,7 @@
 //	specialFileFD.mu
 //	  specialFileFD.bufMu
 //
-// Locking dentry.dirMu and dentry.metadataMu in multiple dentries requires that
+// Locking dentry.opMu and dentry.metadataMu in multiple dentries requires that
 // either ancestor dentries are locked before descendant dentries, or that
 // filesystem.renameMu is locked for writing.
 package gofer
@@ -693,11 +694,11 @@ func (d *dentry) releaseSyntheticRecursiveLocked(ctx context.Context) {
 	}
 	if d.isDir() {
 		var children []*dentry
-		d.dirMu.Lock()
+		d.childrenMu.Lock()
 		for _, child := range d.children {
 			children = append(children, child)
 		}
-		d.dirMu.Unlock()
+		d.childrenMu.Unlock()
 		for _, child := range children {
 			if child != nil {
 				child.releaseSyntheticRecursiveLocked(ctx)
@@ -781,7 +782,12 @@ type dentry struct {
 	// protected by filesystem.syncMu.
 	syncableListEntry dentryListElem
 
-	dirMu sync.Mutex `state:"nosave"`
+	// opMu synchronizes operations on this dentry. Operations that mutate
+	// the dentry must hold this lock for writing.
+	opMu sync.RWMutex `state:"nosave"`
+
+	// childrenMu protects the cached children data for this dentry.
+	childrenMu sync.Mutex `state:"nosave"`
 
 	// If this dentry represents a directory, children contains:
 	//
@@ -791,28 +797,29 @@ type dentry struct {
 	//		dentries (only if InteropModeShared is not in effect and the directory
 	//		is not synthetic).
 	//
-	// children is protected by dirMu.
+	// children is protected by childrenMu.
 	children map[string]*dentry
 
 	// If this dentry represents a directory, negativeChildrenCache cache
-	// names of negative children, negativeChildrenCache is protected by dirMu.
+	// names of negative children, negativeChildrenCache is protected by
+	// childrenMu.
 	negativeChildrenCache stringFixedCache
 	// If this dentry represents a directory, negativeChildren is the number
 	// of negative children cached in dentry.children. negativeChildren is
-	// protected by dirMu.
+	// protected by childrenMu..
 	negativeChildren int
 
 	// If this dentry represents a directory, syntheticChildren is the number
 	// of child dentries for which dentry.isSynthetic() == true.
-	// syntheticChildren is protected by dirMu.
+	// syntheticChildren is protected by childrenMu..
 	syntheticChildren int
 
 	// If this dentry represents a directory,
-	// dentry.cachedMetadataAuthoritative() == true, and dirents is not nil, it
-	// is a cache of all entries in the directory, in the order they were
-	// returned by the server. childrenSet just stores the `Name` field of all
-	// dirents in a set for fast query. dirents and childrenSet are protected by
-	// dirMu and share the same lifecycle.
+	// dentry.cachedMetadataAuthoritative() == true, and dirents is not
+	// nil, then dirents is a cache of all entries in the directory, in the
+	// order they were returned by the server. childrenSet just stores the
+	// `Name` field of all dirents in a set for fast query. dirents and
+	// childrenSet are protected by childrenMu and share the same lifecycle.
 	dirents     []vfs.Dirent
 	childrenSet map[string]struct{}
 
@@ -1345,7 +1352,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 
 // Preconditions:
 // - filesystem.renameMu must be locked.
-// - d.dirMu must be locked.
+// - d.opMu must be locked for writing.
 // - d.isDir().
 func (d *dentry) mknodLocked(ctx context.Context, name string, creds *auth.Credentials, opts vfs.MknodOptions, ds **[]*dentry) error {
 	if _, ok := opts.Endpoint.(transport.HostBoundEndpoint); !ok {
@@ -1677,9 +1684,9 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 			defer d.fs.renameMu.Unlock()
 		}
 		if d.parent != nil {
-			d.parent.dirMu.Lock()
+			d.parent.childrenMu.Lock()
 			delete(d.parent.children, d.name)
-			d.parent.dirMu.Unlock()
+			d.parent.childrenMu.Unlock()
 		}
 		d.destroyLocked(ctx) // +checklocksforce: see above.
 		return
@@ -1784,17 +1791,21 @@ func (d *dentry) evictLocked(ctx context.Context) {
 		return
 	}
 	if d.parent != nil {
-		d.parent.dirMu.Lock()
 		if !d.vfsd.IsDead() {
+			d.parent.opMu.Lock()
 			// Note that d can't be a mount point (in any mount namespace), since VFS
 			// holds references on mount points.
 			d.fs.vfsfs.VirtualFilesystem().InvalidateDentry(ctx, &d.vfsd)
+
+			d.parent.childrenMu.Lock()
 			delete(d.parent.children, d.name)
+			d.parent.childrenMu.Unlock()
+
+			d.parent.opMu.Unlock()
 			// We're only deleting the dentry, not the file it
 			// represents, so we don't need to update
 			// victim parent.dirents etc.
 		}
-		d.parent.dirMu.Unlock()
 	}
 	// Safe to unlock cachingMu now that d.vfsd.IsDead(). Henceforth any
 	// concurrent caching attempts on d will attempt to destroy it and so will

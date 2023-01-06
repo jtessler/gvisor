@@ -88,9 +88,9 @@ func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFile
 		return nil
 	}
 
-	parent.dirMu.Lock()
+	parent.childrenMu.Lock()
 	child, ok := parent.children[name]
-	parent.dirMu.Unlock()
+	parent.childrenMu.Unlock()
 	if !ok {
 		return nil
 	}
@@ -200,9 +200,9 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath,
 		return d.parent, errPartialRevalidation{}
 
 	default:
-		d.dirMu.Lock()
+		d.childrenMu.Lock()
 		child, ok := d.children[name]
-		d.dirMu.Unlock()
+		d.childrenMu.Unlock()
 		if !ok {
 			// child is not cached, no need to validate any further.
 			return nil, errRevalidationStepDone{}
@@ -277,7 +277,7 @@ func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualF
 			*ds = appendDentry(*ds, d)
 
 			name := state.names[i]
-			d.parent.dirMu.Lock()
+			d.parent.opMu.RLock()
 
 			if d.isSynthetic() {
 				// Normally we don't mark invalidated dentries as deleted since
@@ -289,18 +289,23 @@ func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualF
 				d.decRefNoCaching()
 				*ds = appendDentry(*ds, d)
 
+				d.childrenMu.Lock()
 				d.parent.syntheticChildren--
+				d.childrenMu.Unlock()
+
 				d.parent.clearDirentsLocked()
 			}
 
-			// Since the dirMu was released and reacquired, re-check that the
+			// Since the opMu was released and reacquired, re-check that the
 			// parent's child with this name is still the same. Do not touch it if
 			// it has been replaced with a different one.
+			d.childrenMu.Lock()
 			if child := d.parent.children[name]; child == d {
 				// Invalidate dentry so it gets reloaded next time it's accessed.
 				delete(d.parent.children, name)
 			}
-			d.parent.dirMu.Unlock()
+			d.childrenMu.Unlock()
+			d.parent.opMu.RUnlock()
 
 			return nil
 		}

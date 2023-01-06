@@ -174,7 +174,7 @@ func (fs *filesystem) renameMuUnlockAndCheckCaching(ctx context.Context, ds **[]
 //
 // Preconditions:
 //   - fs.renameMu must be locked.
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for reading.
 //   - !rp.Done().
 //   - If !d.cachedMetadataAuthoritative(), then d and all children that are
 //     part of rp must have been revalidated.
@@ -226,7 +226,7 @@ func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *
 
 // Preconditions:
 //   - fs.renameMu must be locked.
-//   - parent.dirMu must be locked.
+//   - parent.opMu must be locked for reading.
 //   - parent.isDir().
 //   - parent and the dentry at name have been revalidated.
 func (fs *filesystem) getChildAndWalkPathLocked(ctx context.Context, parent *dentry, rp *vfs.ResolvingPath, ds **[]*dentry) (*dentry, error) {
@@ -236,7 +236,9 @@ func (fs *filesystem) getChildAndWalkPathLocked(ctx context.Context, parent *den
 	if len(first) > MaxFilenameLen {
 		return nil, linuxerr.ENAMETOOLONG
 	}
+	parent.childrenMu.Lock()
 	if child, ok := parent.children[first]; ok || parent.isSynthetic() {
+		parent.childrenMu.Unlock()
 		if child == nil {
 			return nil, linuxerr.ENOENT
 		}
@@ -246,9 +248,11 @@ func (fs *filesystem) getChildAndWalkPathLocked(ctx context.Context, parent *den
 	if parent.childrenSet != nil {
 		// Is the first child even there? Don't make RPC if not.
 		if _, ok := parent.childrenSet[first]; !ok {
+			parent.childrenMu.Unlock()
 			return nil, linuxerr.ENOENT
 		}
 	}
+	parent.childrenMu.Unlock()
 
 	// Walk as much of the path as possible in 1 RPC.
 	names := []string{first}
@@ -275,12 +279,12 @@ func (fs *filesystem) getChildAndWalkPathLocked(ctx context.Context, parent *den
 	curParent := parent
 	curParentDirMuLock := func() {
 		if curParent != parent {
-			curParent.dirMu.Lock()
+			curParent.opMu.RLock()
 		}
 	}
 	curParentDirMuUnlock := func() {
 		if curParent != parent {
-			curParent.dirMu.Unlock() // +checklocksforce: locked via curParentDirMuLock().
+			curParent.opMu.RUnlock() // +checklocksforce: locked via curParentDirMuLock().
 		}
 	}
 	var ret *dentry
@@ -328,7 +332,7 @@ func (fs *filesystem) getChildAndWalkPathLocked(ctx context.Context, parent *den
 //
 // Preconditions:
 //   - fs.renameMu must be locked.
-//   - parent.dirMu must be locked.
+//   - parent.opMu must be locked for reading.
 //   - parent.isDir().
 //   - name is not "." or "..".
 //   - parent and the dentry at name have been revalidated.
@@ -336,7 +340,9 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 	if len(name) > MaxFilenameLen {
 		return nil, linuxerr.ENAMETOOLONG
 	}
+	parent.childrenMu.Lock()
 	if child, ok := parent.children[name]; ok || parent.isSynthetic() {
+		parent.childrenMu.Unlock()
 		if child == nil {
 			return nil, linuxerr.ENOENT
 		}
@@ -346,9 +352,11 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 	if parent.childrenSet != nil {
 		// Is the child even there? Don't make RPC if not.
 		if _, ok := parent.childrenSet[name]; !ok {
+			parent.childrenMu.Unlock()
 			return nil, linuxerr.ENOENT
 		}
 	}
+	parent.childrenMu.Unlock()
 
 	childInode, err := parent.controlFDLisa.Walk(ctx, name)
 	if err != nil {
@@ -383,9 +391,9 @@ func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 		return nil, err
 	}
 	for !rp.Final() {
-		d.dirMu.Lock()
+		d.opMu.RLock()
 		next, followedSymlink, err := fs.stepLocked(ctx, rp, d, true /* mayFollowSymlinks */, ds)
-		d.dirMu.Unlock()
+		d.opMu.RUnlock()
 		if err != nil {
 			return nil, err
 		}
@@ -411,9 +419,9 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath, 
 		return nil, err
 	}
 	for !rp.Done() {
-		d.dirMu.Lock()
+		d.opMu.RLock()
 		next, followedSymlink, err := fs.stepLocked(ctx, rp, d, true /* mayFollowSymlinks */, ds)
-		d.dirMu.Unlock()
+		d.opMu.RUnlock()
 		if err != nil {
 			return nil, err
 		}
@@ -463,8 +471,8 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return err
 	}
 
-	parent.dirMu.Lock()
-	defer parent.dirMu.Unlock()
+	parent.opMu.Lock()
+	defer parent.opMu.Unlock()
 
 	if len(name) > MaxFilenameLen {
 		return linuxerr.ENAMETOOLONG
@@ -473,14 +481,18 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	// don't check for existence just yet. We will check for existence if the
 	// checks for writability fail below. Existence check is done by the creation
 	// RPCs themselves.
+	parent.childrenMu.Lock()
 	if child, ok := parent.children[name]; ok && child != nil {
+		parent.childrenMu.Unlock()
 		return linuxerr.EEXIST
 	}
 	if parent.childrenSet != nil {
 		if _, ok := parent.childrenSet[name]; ok {
+			parent.childrenMu.Unlock()
 			return linuxerr.EEXIST
 		}
 	}
+	parent.childrenMu.Unlock()
 	checkExistence := func() error {
 		if child, err := fs.getChildLocked(ctx, parent, name, &ds); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
 			return err
@@ -533,11 +545,13 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return err
 	}
 	if fs.opts.interop != InteropModeShared {
+		parent.childrenMu.Lock()
 		if child, ok := parent.children[name]; ok && child == nil {
 			// Delete the now-stale negative dentry.
 			delete(parent.children, name)
 			parent.negativeChildren--
 		}
+		parent.childrenMu.Unlock()
 		parent.touchCMtime()
 		parent.clearDirentsLocked()
 	}
@@ -589,14 +603,17 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
 
-	parent.dirMu.Lock()
-	defer parent.dirMu.Unlock()
+	parent.opMu.Lock()
+	defer parent.opMu.Unlock()
 
+	parent.childrenMu.Lock()
 	if parent.childrenSet != nil {
 		if _, ok := parent.childrenSet[name]; !ok {
+			parent.childrenMu.Unlock()
 			return linuxerr.ENOENT
 		}
 	}
+	parent.childrenMu.Unlock()
 
 	// Load child if sticky bit is set because we need to determine whether
 	// deletion is allowed.
@@ -624,16 +641,16 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	//
 	// Also note that if child is nil, then it can't be a mount point.
 	if child != nil {
-		// Hold child.dirMu so we can check child.children and
+		// Hold child.childrenMu so we can check child.children and
 		// child.syntheticChildren. We don't access these fields until a bit later,
-		// but locking child.dirMu after calling vfs.PrepareDeleteDentry() would
-		// create an inconsistent lock ordering between dentry.dirMu and
-		// vfs.Dentry.mu (in the VFS lock order, it would make dentry.dirMu both "a
+		// but locking child.childrenMu after calling vfs.PrepareDeleteDentry() would
+		// create an inconsistent lock ordering between dentry.childrenMu and
+		// vfs.Dentry.mu (in the VFS lock order, it would make dentry.childrenMu both "a
 		// FilesystemImpl lock" and "a lock acquired by a FilesystemImpl between
 		// PrepareDeleteDentry and CommitDeleteDentry). To avoid this, lock
-		// child.dirMu before calling PrepareDeleteDentry.
-		child.dirMu.Lock()
-		defer child.dirMu.Unlock()
+		// child.childrenMu before calling PrepareDeleteDentry.
+		child.childrenMu.Lock()
+		defer child.childrenMu.Unlock()
 		if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
 			return err
 		}
@@ -985,19 +1002,34 @@ afterTrailingSymlink:
 	if err := fs.revalidateOne(ctx, rp.VirtualFilesystem(), parent, rp.Component(), &ds); err != nil {
 		return nil, err
 	}
-	// Determine whether or not we need to create a file.
-	parent.dirMu.Lock()
+	// Determine whether or not we need to create a file. Don't hold opMu
+	// for writing here, to avoid serializing OpenAt calls in the same
+	// directory in the common case that the files exist.
+	parent.opMu.RLock()
 	child, _, err := fs.stepLocked(ctx, rp, parent, false /* mayFollowSymlinks */, &ds)
+	parent.opMu.RUnlock()
 	if linuxerr.Equals(linuxerr.ENOENT, err) && mayCreate {
 		if parent.isSynthetic() {
-			parent.dirMu.Unlock()
 			return nil, linuxerr.EPERM
 		}
-		fd, err := parent.createAndOpenChildLocked(ctx, rp, &opts, &ds)
-		parent.dirMu.Unlock()
-		return fd, err
+
+		// Take opMu for writing, but note that the file may have been
+		// created by another goroutine since we checked for existence
+		// a few lines ago. We must handle that case.
+		parent.opMu.Lock()
+		fd, createErr := parent.createAndOpenChildLocked(ctx, rp, &opts, &ds)
+		if !linuxerr.Equals(linuxerr.EEXIST, createErr) {
+			parent.opMu.Unlock()
+			return fd, createErr
+		}
+
+		// We raced, and now the file exists. No problem, just step to
+		// it again. Since we still hold opMu for writing, there can't
+		// be a race here.
+		child, _, err = fs.stepLocked(ctx, rp, parent, false /* mayFollowSymlinks */, &ds)
+		parent.opMu.Unlock()
+
 	}
-	parent.dirMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -1187,7 +1219,7 @@ retry:
 
 // Preconditions:
 //   - d.fs.renameMu must be locked.
-//   - d.dirMu must be locked.
+//   - d.opMu must be locked for writing.
 //   - !d.isSynthetic().
 func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, ds **[]*dentry) (*vfs.FileDescription, error) {
 	if err := d.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
@@ -1349,8 +1381,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 
 	// We need a dentry representing the renamed file since, if it's a
 	// directory, we need to check for write permission on it.
-	oldParent.dirMu.Lock()
-	defer oldParent.dirMu.Unlock()
+	oldParent.opMu.Lock()
+	defer oldParent.opMu.Unlock()
 	renamed, err := fs.getChildLocked(ctx, oldParent, oldName, &ds)
 	if err != nil {
 		return err
@@ -1377,8 +1409,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
 			return err
 		}
-		newParent.dirMu.Lock()
-		defer newParent.dirMu.Unlock()
+		newParent.opMu.Lock()
+		defer newParent.opMu.Unlock()
 	}
 	if newParent.isDeleted() {
 		return linuxerr.ENOENT
