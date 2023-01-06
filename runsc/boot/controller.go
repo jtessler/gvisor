@@ -126,7 +126,6 @@ const (
 const (
 	UsageCollect = "Usage.Collect"
 	UsageUsageFD = "Usage.UsageFD"
-	UsageReduce  = "Usage.Reduce"
 )
 
 // Metrics related commands (see metrics.go).
@@ -140,11 +139,6 @@ const (
 	CgroupsReadControlFiles  = "Cgroups.ReadControlFiles"
 	CgroupsWriteControlFiles = "Cgroups.WriteControlFiles"
 )
-
-// ControlSocketAddr generates an abstract unix socket name for the given ID.
-func ControlSocketAddr(id string) string {
-	return fmt.Sprintf("\x00runsc-sandbox.%s", id)
-}
 
 // controller holds the control server, and is used for communication into the
 // sandbox.
